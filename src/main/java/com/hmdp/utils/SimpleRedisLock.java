@@ -2,7 +2,8 @@ package com.hmdp.utils;
 
 import org.springframework.data.redis.core.StringRedisTemplate;
 
-import javax.annotation.Resource;
+import jakarta.annotation
+.Resource;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 

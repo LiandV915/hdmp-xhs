@@ -6,7 +6,8 @@ import com.hmdp.service.IFollowService;
 import com.hmdp.service.impl.FollowServiceImpl;
 import org.springframework.web.bind.annotation.*;
 
-import javax.annotation.Resource;
+import jakarta.annotation
+.Resource;
 
 /**
  * <p>

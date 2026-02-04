@@ -4,13 +4,13 @@ import com.hmdp.utils.LoginInterceptor;
 import com.hmdp.utils.RateLimitInterceptor;
 import com.hmdp.utils.RefreshTokenInterceptor;
 import com.hmdp.utils.ZSetRateLimiter;
-import org.intellij.lang.annotations.JdkConstants;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
-import javax.annotation.Resource;
+import jakarta.annotation
+.Resource;
 
 @Configuration
 public class WebMVCConfig implements WebMvcConfigurer {
