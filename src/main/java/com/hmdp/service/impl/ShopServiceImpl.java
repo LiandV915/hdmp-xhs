@@ -11,11 +11,15 @@ import com.hmdp.mapper.ShopMapper;
 import com.hmdp.service.IShopService;
 import com.hmdp.utils.CacheClient;
 import com.hmdp.utils.RedisConstants;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.ai.vectorstore.redis.RedisVectorStore;
 import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import jakarta.annotation.Resource;
+
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
@@ -41,8 +45,10 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     private StringRedisTemplate stringRedisTemplate;
 
     @Resource
+    private VectorStore vectorStore;
+
+    @Resource
     private CacheClient cacheClient;
-    private TreeCodec treeCodec;
 
 
     @Override
@@ -155,6 +161,54 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     }
 
 
+    /**
+     * 存数据
+     * @param shop
+     */
+    @Override
+    @Transactional
+    public void saveShopWithVector(Shop shop) {
+        // 1. 保存到 MySQL
+        this.save(shop);
+        // 2. 构造向量文本
+        String content = buildShopVectorText(shop);
+
+        // 3. 构造 Document
+        Document document = new Document(
+                content,
+                Map.of(
+                        "shopId", shop.getId(),
+                        "typeId", shop.getTypeId(),
+                        "name", shop.getName(),
+                        "area", shop.getArea()
+                )
+        );
+
+        // 4. 写入 Redis 向量库
+        vectorStore.add(List.of(document));
+    }
+
+    /**
+     * 店铺信息 → 向量文本
+     */
+    private String buildShopVectorText(Shop shop) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("店铺名称：").append(shop.getName()).append("。");
+        sb.append("商圈：").append(shop.getArea()).append("。");
+        sb.append("地址：").append(shop.getAddress()).append("。");
+
+        if (shop.getAvgPrice() != null) {
+            sb.append("人均消费：").append(shop.getAvgPrice()).append("元。");
+        }
+        if (shop.getScore() != null) {
+            sb.append("评分：").append(shop.getScore() / 10.0).append("分。");
+        }
+        if (shop.getOpenHours() != null) {
+            sb.append("营业时间：").append(shop.getOpenHours()).append("。");
+        }
+
+        return sb.toString();
+    }
     /**
      * 尝试获取锁
      * @param key

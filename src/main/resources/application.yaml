@@ -1,13 +1,31 @@
 server:
-  port: 8081
+  port: 8083
 spring:
   application:
-    name: hmdp
+    name: dianping+xhs
   datasource:
     driver-class-name: com.mysql.cj.jdbc.Driver
     url: jdbc:mysql://127.0.0.1:3306/hmdp?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true
     username: root
     password: Lyf20040915
+  ai:
+    openai:
+      api-key: sk-85d93a3c1cf64214b95cd9bbfdd13a2a
+      base-url: https://dashscope.aliyuncs.com/compatible-mode
+      chat:
+        options:
+          model: qwen-max
+      embedding:
+        options:
+          model: text-embedding-v3 # 向量模型名称
+          dimensions: 1024 # 向量维度，v3默认就是1024，可以不写
+    vectorstore:
+      redis:
+        host: localhost
+        port: 6380   # 👈 关键在这里
+        index: rag_index #Redis 里向量索引的名字
+        prefix: 'rag:' #向量数据的 key 前缀
+        initialize-schema: true
 
   redis:
     host: localhost
@@ -40,4 +58,5 @@ mybatis-plus:
   type-aliases-package: com.hmdp.entity # 别名扫描包
 logging:
   level:
-    com.hmdp: info
+    com.hmdp: debug
+    org.springframework.ai.chat.client.advisor: debug

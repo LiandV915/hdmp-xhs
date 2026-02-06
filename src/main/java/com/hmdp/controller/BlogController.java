@@ -2,6 +2,7 @@ package com.hmdp.controller;
 
 
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
+import com.hmdp.dto.BlogSaveDTO;
 import com.hmdp.dto.Result;
 import com.hmdp.dto.UserDTO;
 import com.hmdp.entity.Blog;
@@ -38,9 +39,10 @@ public class BlogController {
         // 获取登录用户
         UserDTO user = UserHolder.getUser();
         blog.setUserId(user.getId());
-        // 保存探店博文
-        blogService.save(blog);
-        // 返回id
+
+        // 保存博客 + 向量化
+        blogService.saveBlogWithVector(blog);
+
         return Result.ok(blog.getId());
     }
 
@@ -108,5 +110,7 @@ public class BlogController {
         List<Blog> blogs = blogService.recommendBlogs(user != null ? user.getId() : null, size);
         return Result.ok(blogs);
     }
+
+
 
 }

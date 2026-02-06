@@ -5,6 +5,7 @@ import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
+import com.hmdp.dto.BlogSaveDTO;
 import com.hmdp.dto.Result;
 import com.hmdp.dto.UserDTO;
 import com.hmdp.entity.Blog;
@@ -14,6 +15,9 @@ import com.hmdp.service.IBlogService;
 import com.hmdp.service.IUserService;
 import com.hmdp.utils.SystemConstants;
 import com.hmdp.utils.UserHolder;
+import org.springframework.ai.document.Document;
+import org.springframework.ai.vectorstore.VectorStore;
+import org.springframework.ai.vectorstore.redis.RedisVectorStore;
 import org.springframework.beans.BeanUtils;
 import org.springframework.core.io.ClassPathResource;
 import org.springframework.dao.DataAccessException;
@@ -28,6 +32,8 @@ import org.springframework.transaction.annotation.Transactional;
 
 import jakarta.annotation
 .Resource;
+
+import java.time.LocalDateTime;
 import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
@@ -48,6 +54,10 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
 
     @Resource
     StringRedisTemplate stringRedisTemplate;
+
+
+    @Resource
+    private VectorStore vectorStore;
 
     private static final DefaultRedisScript<Long> VIEW_SCRIPT;
 
@@ -330,4 +340,43 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
         //4.返回
         return Result.ok(userDTOS);
     }
+
+    @Override
+    @Transactional
+    public void saveBlogWithVector(Blog blog) {
+        // 1. 初始化字段
+        blog.setLiked(0);
+        blog.setComments(0);
+        blog.setViewCounts(0);
+        // 1. 保存到 MySQL
+        this.save(blog);
+        // 2. 构造向量文本
+        String content = buildBlogVectorText(blog);
+        // 3. 构造 Document
+        Document document = new Document(
+                content,
+                Map.of(
+                        "blogId", blog.getId(),
+                        "shopId", blog.getShopId(),
+                        "userId", blog.getUserId(),
+                        "tags", blog.getTags() == null ? "" : blog.getTags()
+                )
+        );
+        // 4. 写入 Redis 向量库(自动embedding）
+        vectorStore.add(List.of(document));
+    }
+
+    /**
+     * 博客 → 向量文本
+     */
+    private String buildBlogVectorText(Blog blog) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("探店标题：").append(blog.getTitle()).append("。");
+        sb.append("探店内容：").append(blog.getContent()).append("。");
+        if (blog.getTags() != null) {
+            sb.append("标签：").append(blog.getTags()).append("。");
+        }
+        return sb.toString();
+    }
+
 }

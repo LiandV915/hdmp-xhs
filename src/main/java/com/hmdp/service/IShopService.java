@@ -19,4 +19,10 @@ public interface IShopService extends IService<Shop> {
     Result update(Shop shop);
 
     void loadShopToCache();
+
+    /**
+     * 保存店铺，并同步写入向量库
+     */
+    void saveShopWithVector(Shop shop);
+
 }

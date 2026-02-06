@@ -1,6 +1,7 @@
 package com.hmdp.service;
 
 import com.baomidou.mybatisplus.extension.service.IService;
+import com.hmdp.dto.BlogSaveDTO;
 import com.hmdp.dto.Result;
 import com.hmdp.entity.Blog;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -24,4 +25,11 @@ public interface IBlogService extends IService<Blog> {
     Result updateLikedCounts(Long id);
 
     Result getBlogLikes(Long id);
+
+
+    /**
+     * 保存探店博客，并同步写入向量库
+     */
+    void saveBlogWithVector(Blog blog);
+
 }

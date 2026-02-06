@@ -7,6 +7,8 @@ import com.hmdp.dto.Result;
 import com.hmdp.entity.Shop;
 import com.hmdp.service.IShopService;
 import com.hmdp.utils.SystemConstants;
+import org.springframework.ai.embedding.EmbeddingModel;
+import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.web.bind.annotation.*;
 
 import jakarta.annotation
@@ -27,6 +29,11 @@ public class ShopController {
     @Resource
     public IShopService shopService;
 
+    @Resource
+    private EmbeddingModel embeddingModel;
+
+    @Resource
+    private VectorStore vectorStore;
     /**
      * 根据id查询商铺信息
      *
@@ -47,12 +54,9 @@ public class ShopController {
      */
     @PostMapping
     public Result saveShop(@RequestBody Shop shop) {
-        // 写入数据库
-        shopService.save(shop);
-        // 返回店铺id
+        shopService.saveShopWithVector(shop);
         return Result.ok(shop.getId());
     }
-
     /**
      * 更新商铺信息
      *

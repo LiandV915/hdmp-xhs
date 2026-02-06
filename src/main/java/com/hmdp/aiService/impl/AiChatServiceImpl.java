@@ -1,0 +1,80 @@
+package com.hmdp.aiService.impl;
+
+import com.hmdp.aiService.AiChatService;
+import com.hmdp.aiService.EmbeddingService;
+import com.hmdp.aiService.VectorSearchService;
+import com.hmdp.utils.InMemoryChatMemory;
+import jakarta.annotation.Resource;
+import lombok.RequiredArgsConstructor;
+import org.springframework.ai.chat.client.ChatClient;
+import org.springframework.stereotype.Service;
+import reactor.core.publisher.Flux;
+
+import java.util.Deque;
+import java.util.List;
+
+@Service
+@RequiredArgsConstructor
+public class AiChatServiceImpl implements AiChatService {
+
+    private final ChatClient chatClient;
+    private final EmbeddingService embeddingService;
+    private final VectorSearchService vectorSearchService;
+
+    @Resource
+    InMemoryChatMemory chatMemory;
+
+
+    @Override
+    public Flux<String> chat(String question,Long userId) {
+
+        // 1. 读取上下文（不给任何判断规则）
+        Deque<String> memory = chatMemory.getContext(userId);
+        String contextText = String.join("\n", memory);
+
+        // 2. 直接用原始 question 做 embedding（不做 rewrite）
+        float[] queryVector = embeddingService.embed(question);
+
+        // 3. 向量召回
+        List<String> contexts = vectorSearchService.search(queryVector, 3);
+
+        // 4. Prompt 环绕增强
+        String ragPrompt = buildPrompt(contextText, contexts, question);
+
+        // 5. 调用 LLM（streaming）
+        Flux<String> flux = chatClient.prompt()
+                .user(ragPrompt)
+                .stream()
+                .content();
+
+        // 6. 写回 memory（用户输入 + AI 输出摘要）
+        chatMemory.append(userId, "用户", question);
+        chatMemory.append(userId, "助手", "正在推荐相关内容");
+
+        return flux;
+    }
+
+
+    public String buildPrompt(String chatContext,
+                               List<String> ragContexts,
+                               String question) {
+
+        String knowledge = String.join("\n\n", ragContexts);
+
+        return """
+            你是一个本地生活推荐助手。
+
+            以下是与该用户最近对话相关的上下文（可能不完整）：
+            %s
+
+            以下是检索到的参考信息：
+            %s
+
+            请结合上下文，理解用户当前问题中的省略信息，并给出回答。
+
+            用户当前问题：
+            %s
+            """.formatted(chatContext, knowledge, question);
+    }
+
+}
