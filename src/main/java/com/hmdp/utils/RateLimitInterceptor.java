@@ -16,6 +16,7 @@ import jakarta.servlet
 @Component
 public class RateLimitInterceptor implements HandlerInterceptor {
 
+
     @Resource
     private ZSetRateLimiter rateLimiter;
 
@@ -26,7 +27,6 @@ public class RateLimitInterceptor implements HandlerInterceptor {
 
         UserDTO userDTO = UserHolder.getUser();
         String key;
-
         if (userDTO != null) {
             // 已登录用户：按 userId 限流
             key = "rate:limit:user:" + userDTO.getId();

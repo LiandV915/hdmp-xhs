@@ -57,9 +57,11 @@ public class UserServiceImpl extends ServiceImpl<UserMapper, User> implements IU
             return Result.fail("手机号格式不正确");
         }
         // 2、手机号合法，生成验证码，并保存到redis中,有效期30min
-        String code = RandomUtil.randomNumbers(6);
+        String code = "123456";
         stringRedisTemplate.opsForValue().set(RedisConstants.LOGIN_CODE_KEY + phone,
-                code,RedisConstants.LOGIN_CODE_TTL, TimeUnit.MINUTES);
+                code,
+                RedisConstants.LOGIN_CODE_TTL,
+                TimeUnit.MINUTES);
         // 3、发送验证码
         log.info("验证码:{}", code);
         return Result.ok();

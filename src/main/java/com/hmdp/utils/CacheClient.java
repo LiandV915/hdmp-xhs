@@ -6,8 +6,7 @@ import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONObject;
 import cn.hutool.json.JSONUtil;
 
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
+import java.util.concurrent.*;
 import java.util.function.Function;
 
 import com.hmdp.entity.Shop;
@@ -21,7 +20,6 @@ import org.springframework.stereotype.Component;
 import jakarta.annotation
 .Resource;
 import java.time.LocalDateTime;
-import java.util.concurrent.TimeUnit;
 
 
 @Component
@@ -32,8 +30,16 @@ public class CacheClient {
     @Autowired
     RedissonClient redissonClient;
 
-    private static final ExecutorService CACHE_REBUILD_EXECUTOR = Executors.newFixedThreadPool(10);
-
+    private static final ExecutorService CACHE_REBUILD_EXECUTOR =
+            new ThreadPoolExecutor(
+                    5,                      // corePoolSize
+                    10,                     // maxPoolSize
+                    60,
+                    TimeUnit.SECONDS,
+                    new LinkedBlockingQueue<>(100),
+                    Executors.defaultThreadFactory(),
+                    new ThreadPoolExecutor.CallerRunsPolicy()
+            );
 
     /**
      * 存数据
@@ -72,37 +78,87 @@ public class CacheClient {
 
     /**
      * 旁路缓存思想
-     * 防止缓存穿透查数据
-     * (不确定返回类型，id类型，用泛型,无法确定调用哪个mapper，函数式编程传方法）
-     * 在「逻辑过期」这套方案下，一般不再需要靠“随机 TTL”来防缓存雪崩了。
-     * 但这里面有一个前提条件，我给你讲清楚你才能在面试 / 项目说明里说得住。
+     * 旁路缓存 + 分布式互斥锁防击穿
+     *热点 Blog 过期时：
+     * 仍然只有一个线程去访问数据库。
+     * 其它并发线程不会同时打到数据库 → 击穿被阻止。
+     * 和逻辑过期方案相比：
+     * queryPassThrough 会阻塞或轮询等待锁。
+     * queryWithLogicalExpire 则是返回旧数据 + 异步刷新 → 不阻塞线程
      */
-    public <R, ID> R queryPassThrough(String keyPrefix, ID id, Class<R> type, Function<ID, R> dbFallBack, Long time, TimeUnit timeUnit) {
+    public <R, ID> R queryPassThrough(
+            String keyPrefix,
+            ID id,
+            Class<R> type,
+            Function<ID, R> dbFallBack,
+            Long time,
+            TimeUnit timeUnit
+    ) {
         String key = keyPrefix + id;
+        // 1. 先查 Redis
         String json = stringRedisTemplate.opsForValue().get(key);
         if (StrUtil.isNotEmpty(json)) {
             return JSONUtil.toBean(json, type);
         }
-        if (json != null) {//查到“”
+        if (json != null) { // 查到空值，防穿透
             return null;
         }
-        R r = dbFallBack.apply(id);//传入某个类对应的查数据库的方法
-        if (r == null) {//缓存空对象
-            stringRedisTemplate.opsForValue().set(key, "", RedisConstants.CACHE_NULL_TTL, TimeUnit.SECONDS);
-            return null;
+        // 2. 获取分布式锁
+        String lockKey = "lock:" + key;
+        RLock lock = redissonClient.getLock(lockKey);
+        try {
+            // 尝试加锁，最多等待100毫秒，锁过期时间 10秒
+            boolean isLock = lock.tryLock(100, 10, TimeUnit.SECONDS);
+            if (isLock) {
+                // 再次查询 Redis，防止锁竞争期间已经有线程写入
+                json = stringRedisTemplate.opsForValue().get(key);
+                if (StrUtil.isNotEmpty(json)) {
+                    return JSONUtil.toBean(json, type);
+                }
+                if (json != null) {
+                    return null;
+                }
+
+                // 3. 数据库回退查询
+                R r = dbFallBack.apply(id);
+                if (r == null) {
+                    stringRedisTemplate.opsForValue().set(key, "", RedisConstants.CACHE_NULL_TTL, TimeUnit.SECONDS);
+                    return null;
+                }
+                // 4. 写入 Redis，随机 TTL 防雪崩
+                long ttl = time + RandomUtil.randomLong(0, 300);
+                stringRedisTemplate.opsForValue().set(key, JSONUtil.toJsonStr(r), ttl, timeUnit);
+                return r;
+            } else {
+                // 没拿到锁的线程，休眠50ms后重试
+                Thread.sleep(50);
+                return queryPassThrough(keyPrefix, id, type, dbFallBack, time, timeUnit);
+            }
+        } catch (InterruptedException e) {
+            throw new RuntimeException(e);
+        } finally {
+            if (lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
         }
-        long ttl = time + RandomUtil.randomLong(0, 300); // 随机 0~300 秒
-        this.set(key, JSONUtil.toJsonStr(r), ttl, timeUnit);//缓存正确数据
-        return r;
     }
 
+
     /**
-     * 防止缓存击穿（设置逻辑过期时间）、互斥锁.同时通过
+     * 这个方案主要是为了解决缓存击穿问题，通过逻辑过期和分布式锁保证只有一个线程重建缓存，其余请求返回旧数据。
+     * 同时通过缓存空对象可以一定程度解决缓存穿透。
+     * 由于 Redis key 本身不会设置 TTL，而是使用逻辑过期时间，因此也可以避免大量 key 同时失效，从而在一定程度上缓解缓存雪崩。
      */
     public <R, ID> R queryWithLogicalExpire(String keyPrefix, ID id, Class<R> type, Function<ID, R> dbFallBack, Long time, TimeUnit timeUnit) {
         String key = keyPrefix + id;
         String json = stringRedisTemplate.opsForValue().get(key);
-        if ("".equals(json)) {//查到的是空对象
+        if (json == null) {
+            // 缓存未命中 →
+            // 逻辑过期方案通常只用于“热点数据”，这些数据在系统启动时就已经预热到缓存中，因此正常情况下不会出现缓存未命中。
+            return null;
+        }
+        if ("".equals(json)) {
+            // 命中空缓存
             return null;
         }
         //能查到数据，则判断是否逻辑过期
@@ -127,30 +183,21 @@ public class CacheClient {
                         return;
                     }
                     R r1 = dbFallBack.apply(id);
-                    this.setWithExpire(key, JSONUtil.toJsonStr(r1), time, timeUnit);//更新缓存
+                    if (r1 == null) {
+                        stringRedisTemplate.opsForValue().set(key, "", 2, TimeUnit.MINUTES);
+                        return;
+                    }//查不到数据，缓存空对象，防止缓存穿透
+                    this.setWithExpire(key, r1, time, timeUnit);//更新缓存
                 } catch (Exception e) {
 
                 } finally {
                     lock.unlock();
-                    ;
+
                 }
             });
         }
         return r;
 
     }
-/**
- * 逻辑过期防穿透
- * 缓存过期不立即删除，而是继续返回脏数据，保证高并发请求可用性。
- * 对热点数据提前预热，减少第一次访问的数据库压力。
- * Redisson 分布式锁
- * 用 RLock 替代自己写的 setIfAbsent 锁，更安全，支持分布式多节点。
- * 避免多个线程同时重建缓存，保护 DB。
- * 双检机制
- * 异步刷新缓存前再次查询 Redis，避免重复查询 DB。
- * 保证即使多个线程竞争锁，只有一个真正去 DB 查询和更新缓存。
- * 异步刷新
- * 用线程池异步更新缓存，避免阻塞请求，提高系统吞吐
- */
 
 }

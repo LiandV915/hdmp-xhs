@@ -34,13 +34,13 @@ public class RefreshTokenInterceptor implements HandlerInterceptor {
         String key=RedisConstants.LOGIN_USER_KEY+token;
         //从redis查这个token对应的用户数据
         Map<Object,Object> usermap=stringRedisTemplate.opsForHash().entries(key);
-        if(usermap==null){//用户没登录，本层可以放过去，交给登录拦截器处理
+        if(usermap==null) {//用户没登录，本层可以放过去，交给登录拦截器处理
             return true;
         }
         //封装为userDTO，存入threadLocal`
         UserDTO userDTO= BeanUtil.fillBeanWithMap(usermap,new UserDTO(),false);
         // 用户存在，则将用户信息保存到ThreadLocal中，方便后续逻辑处理
-        // 比如：方便获取和使用用户信息，session获取用户信息是具有侵入性的
+        //比如：方便获取和使用用户信息，session获取用户信息是具有侵入性的
         UserHolder.saveUser(userDTO);
 
         //刷新redis有效期

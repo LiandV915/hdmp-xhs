@@ -56,7 +56,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
         Shop shop=cacheClient.queryWithLogicalExpire(RedisConstants.CACHE_SHOP_KEY+id,id,Shop.class,this::getById
                 ,RedisConstants.CACHE_SHOP_TTL,TimeUnit.MINUTES);
         if(shop==null){
-            return Result.fail("查不到数据");
+            return Result.fail("查不到商铺");
         }
         return Result.ok(shop);
     }
@@ -170,6 +170,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     public void saveShopWithVector(Shop shop) {
         // 1. 保存到 MySQL
         this.save(shop);
+
         // 2. 构造向量文本
         String content = buildShopVectorText(shop);
 
@@ -186,6 +187,14 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
         // 4. 写入 Redis 向量库
         vectorStore.add(List.of(document));
+        // 5. 写入缓存（逻辑过期策略）
+        // 使用你的 CacheClient 工具类
+        cacheClient.setWithExpire(
+                RedisConstants.CACHE_SHOP_KEY + shop.getId(), // key
+                shop,                                        // value
+                RedisConstants.CACHE_SHOP_TTL,              // TTL
+                TimeUnit.MINUTES
+        );
     }
 
     /**

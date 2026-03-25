@@ -16,11 +16,10 @@ import java.util.List;
 @RequiredArgsConstructor
 public class AiBlogService {
 
-    private final ChatClient chatClient;
-    private final ObjectMapper objectMapper;
+    private final ChatClient chatClient;//来自 Spring AI，调用大模型
+    private final ObjectMapper objectMapper;//JSON → Java对象
 
     public BlogGenerateVO generateBlog(String userPrompt, Long userId) {
-
         String systemPrompt = """
         你是一个本地生活社区的内容创作助手。
 
@@ -42,8 +41,10 @@ public class AiBlogService {
                 """.formatted(userId, userPrompt))
                 .call()
                 .content();
+        //非流式调用
+        //（一次性返回完整结果）
 
-        // 1️⃣ 反序列化
+        // 1️⃣ 反序列化,JSON → Java对象
         BlogDraftDTO draft;
         try {
             draft = objectMapper.readValue(json, BlogDraftDTO.class);
@@ -65,6 +66,14 @@ public class AiBlogService {
 
         return vo;
     }
+    /**
+     * 最终返回
+     * {
+     * "title":"海底捞探店体验",
+     * "content":"周末和朋友...",
+     * "tags":["火锅","海底捞","聚餐"]
+     * }
+     */
 }
 
 

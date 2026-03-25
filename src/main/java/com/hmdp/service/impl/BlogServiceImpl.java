@@ -13,6 +13,7 @@ import com.hmdp.entity.User;
 import com.hmdp.mapper.BlogMapper;
 import com.hmdp.service.IBlogService;
 import com.hmdp.service.IUserService;
+import com.hmdp.utils.CacheClient;
 import com.hmdp.utils.SystemConstants;
 import com.hmdp.utils.UserHolder;
 import org.springframework.ai.document.Document;
@@ -29,9 +30,11 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import java.time.LocalDate;
+import java.time.format.DateTimeFormatter;
 
-import jakarta.annotation
-.Resource;
+
+import jakarta.annotation.Resource;
 
 import java.time.LocalDateTime;
 import java.util.*;
@@ -55,9 +58,14 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
     @Resource
     StringRedisTemplate stringRedisTemplate;
 
+    @Resource
+    CacheClient cacheClient;
 
     @Resource
     private VectorStore vectorStore;
+
+    @Resource
+    private BlogMapper blogMapper;
 
     private static final DefaultRedisScript<Long> VIEW_SCRIPT;
 
@@ -68,35 +76,50 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
     }
     /**
      浏览量更新：
-     所有用户都会执行，增加 blog:view 的分数。
-     热度更新：
-     仅登录用户的 首次浏览 才会增加 blog:hot 和标签权重。
+     那就是相当于，对于没登录用户无法增加热度，只增加浏览量了呗。
+     对于一登录用户会判断用户是否看过这个文章，如果看过的话就在增加浏览量的基础上增加热度。那
+     么也就是，一篇文章的浏览量可以被无限制的刷，但是用户浏览这一操作只能给文章增加一个热度呗
      用户兴趣画像更新：
      每次用户浏览博客时，分析博客的标签，更新用户的兴趣画像（user:interest:{userId}）。
      我们使用 ZSet 来存储标签和它们的权重，权重值（score）可以根据实际的浏览次数或兴趣强度调整。
+     同时将文章加入user：view：{userId}中，以避免重复推荐。
      * @param blogId
      * @return
      */
     @Override
     public Result getBlogById(Long blogId) {
-        Blog blog = getById(blogId);
-        if (blog == null) return Result.fail("博客不存在");
+        // 1️⃣ 先查缓存（旁路缓存 + 空对象防穿透）
+        Blog blog = cacheClient.queryPassThrough(
+                "blog:cache:",
+                blogId,
+                Blog.class,
+                blogMapper::selectById,
+                600L,
+                TimeUnit.SECONDS
+        );
+        if (blog == null) {
+            return Result.fail("博客不存在");
+        }
+
         UserDTO user = UserHolder.getUser();
         Long userId = user != null ? user.getId() : null;
+
         // ===============================
-        // 1️⃣ PV统计 —— 只走Redis
+        // 2️⃣ PV统计 —— 所有人增加
         // ===============================
         Double pv = stringRedisTemplate.opsForZSet()
                 .incrementScore("blog:view", blogId.toString(), 1);
+        stringRedisTemplate.opsForSet().add("blog:dirty:view", blogId.toString());
+
+        // 加入脏数据集合，用于定时任务同步
         if (pv != null) {
-            blog.setViewCounts((int) pv.longValue());
+            blog.setViewCounts(pv.intValue());
         }
+
         // ===============================
-        // 2️⃣ 登录用户：首次浏览统计
+        // 3️⃣ 登录用户：首次浏览才增加当日热度 + 更新兴趣画像
         // ===============================
         if (userId != null) {
-            String viewKey = "user:view:" + userId;
-            // 标签 Java 拆分
             List<String> tags = new ArrayList<>();
             if (StrUtil.isNotBlank(blog.getTags())) {
                 tags = Arrays.stream(blog.getTags().split(","))
@@ -104,19 +127,19 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
                         .filter(StrUtil::isNotBlank)
                         .toList();
             }
-            // KEYS
-            List<String> keys = Arrays.asList(
-                    viewKey,
-                    "blog:hot",
-                    "blog:tag:",
-                    "user:interest:" + userId
+            // 当日热度桶 key，例如 blog:hot:20260325
+            String todayHotKey = "blog:hot:" + LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE);
+            List<String> keys = List.of(
+                    "user:view:" + userId,          // KEYS[1]
+                    todayHotKey,                   // KEYS[2]
+                    "user:interest:" + userId      // KEYS[3]
             );
-            // ARGV
+
             List<String> args = new ArrayList<>();
-            args.add(blogId.toString());
-            args.add(String.valueOf(86400)); // 1天TTL
-            args.addAll(tags);
-            // 执行Lua
+            args.add(blogId.toString());            // ARGV[1] blogId
+            args.add(String.valueOf(86400));        // ARGV[2] user:view 集合TTL，1天
+            args.addAll(tags);                      // ARGV[3...] 标签列表
+
             stringRedisTemplate.execute(
                     VIEW_SCRIPT,
                     keys,
@@ -124,7 +147,7 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
             );
 
             // ===============================
-            // 3️⃣ 点赞状态
+            // 4️⃣ 点赞状态
             // ===============================
             Boolean liked = stringRedisTemplate.opsForSet()
                     .isMember("user:like:" + userId, blogId.toString());
@@ -135,6 +158,7 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
 
         return Result.ok(blog);
     }
+
 
 
     /**
@@ -149,17 +173,17 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
      */
     @Override
     public List<Blog> recommendBlogs(Long userId, int size) {
-        // 1️⃣ 游客模式
+        // 1️⃣ 游客模式，直接推送热度最高的
         if (userId == null) {
             Set<String> topHot = stringRedisTemplate.opsForZSet()
                     .reverseRange("blog:hot", 0, size - 1);
             return listByIds(topHot);
         }
         Set<String> candidateBlogIds = new LinkedHashSet<>();//待推送blog
-        // 2️⃣ 获取用户兴趣标签（优化：使用ZRANGE带分数）
+        // 2️⃣ 获取用户兴趣标签（优化：使用ZRANGE带分数）,取用户最感兴趣的前5标签
         Set<String> topTags = stringRedisTemplate.opsForZSet()
                 .reverseRange("user:interest:" + userId, 0, 4);
-        // 3️⃣ 标签召回（优化：限制每个标签召回数量，避免过多）
+        // 3️⃣ 标签召回（优化：限制每个标签召回数量，避免过多），每个标签召回三个
         int perTagLimit = Math.max(3, size / Math.max(topTags.size(), 1));
         if (topTags != null && !topTags.isEmpty()) {
             for (String tag : topTags) {
@@ -168,19 +192,19 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
                 if (blogs != null) candidateBlogIds.addAll(blogs);
             }
         }
-// 4️⃣ 批量获取排除集合(用户看过的，之前推送过的，用户自己写的）
+        // 4️⃣ 批量获取排除集合(用户看过的，之前推送过的，用户自己写的）
         Set<String> excludeIds = new HashSet<>();
         //pipeline 的核心价值就是：减少网络 RTT，避免大量来回的 Redis 请求。
         List<Object> results = stringRedisTemplate.executePipelined(new SessionCallback<Object>() {
             @Override
             public Object execute(RedisOperations operations) {
                 operations.opsForSet().members("user:view:" + userId);
-                operations.opsForSet().members("user:recommend:shown:" + userId);
+                operations.opsForSet().members("recommend:shown:" + userId);
                 operations.opsForSet().members("user:blog:" + userId);
                 return null;
             }
         });
-// 把 pipeline 返回的 3 个 Set<String> 合并到 excludeIds
+        // 把 pipeline 返回的 3 个 Set<String> 合并到 excludeIds
         for (Object obj : results) {
             if (obj instanceof Set) {
                 @SuppressWarnings("unchecked")
@@ -190,7 +214,7 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
         }
         // 5️⃣ 排除处理
         candidateBlogIds.removeAll(excludeIds);
-        // 6️⃣ 冷启动处理（优化：先排除再补充）
+        // 6️⃣ 如果推荐不足：冷启动处理（优化：先排除再补充）
         if (candidateBlogIds.size() < size) {
             int needMore = size - candidateBlogIds.size();
             // 获取热门但未排除的博客
@@ -203,24 +227,35 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
                         .forEach(candidateBlogIds::add);
             }
         }
-        // 7️⃣ 按热度排序（优化：批量获取分数）
+        // 7️⃣ 按热度排序
         if (candidateBlogIds.isEmpty()) {
             return Collections.emptyList();
         }
         // 批量获取热度分数
         Map<String, Double> hotScores = new HashMap<>();
-        stringRedisTemplate.executePipelined(new RedisCallback<Object>() {
-            @Override
-            public Object doInRedis(RedisConnection connection) throws DataAccessException {
-                for (String blogId : candidateBlogIds) {
-                    connection.zSetCommands().zScore(
-                            "blog:hot".getBytes(),
-                            blogId.getBytes()
-                    );
+        List<String> blogIdList = new ArrayList<>(candidateBlogIds);
+        List<Object> scores = stringRedisTemplate.executePipelined(
+                new RedisCallback<Object>() {
+                    @Override
+                    public Object doInRedis(RedisConnection connection) {
+                        for (String blogId : blogIdList) {
+                            connection.zSetCommands().zScore(
+                                    "blog:hot".getBytes(),
+                                    blogId.getBytes()
+                            );
+                        }
+                        return null;
+                    }
                 }
-                return null;
+        );
+// 解析 pipeline 返回值
+        for (int i = 0; i < blogIdList.size(); i++) {
+            Object score = scores.get(i);
+            if (score != null) {
+                hotScores.put(blogIdList.get(i),
+                        Double.valueOf(score.toString()));
             }
-        });
+        }
 
         // 排序
         List<String> sortedBlogIds = candidateBlogIds.stream()
@@ -256,6 +291,10 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
 
     /**
      * 登录用户对某个博客的点赞进行修改（可增可减）
+     * 不建议每次访问直接落库，原因：
+     * 访问频率高：每次浏览落库，数据库写压力大
+     * 批量更新效率低：小量频繁写容易造成锁竞争
+     * 缓存/排行榜系统依赖 Redis：热数据直接落库没有意义
      * @param blogId
      * @return
      */
@@ -267,53 +306,57 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
             return Result.fail("请先登录");
         }
         Long userId = user.getId();
-        String userLikeKey = "user:like:" + userId;
-        String blogLikedKey = "blog:liked";
-        String blogHotKey = "blog:hot";
+        String userLikeKey = "user:like:" + userId; // 用户已点赞文章集合
+        String blogLikedKey = "blog:liked";         // 博客点赞数统计
+        String blogHotKey = "blog:hot:" + LocalDate.now().format(DateTimeFormatter.BASIC_ISO_DATE); // 当天热度桶
 
         Blog blog = getById(blogId);
         if (blog == null) {
             return Result.fail("博客不存在");
         }
 
-        //判断这篇博客是否在用户点赞的集合里
-        boolean isLiked = Boolean.TRUE.equals(stringRedisTemplate.opsForSet().isMember(userLikeKey, blogId.toString()));
+        // 判断是否已点赞
+        boolean isLiked = Boolean.TRUE.equals(
+                stringRedisTemplate.opsForSet().isMember(userLikeKey, blogId.toString())
+        );
         if (!isLiked) {
             // -------------------------------
-            // 点赞操作
+            // 点赞
             // -------------------------------
-            // 1️⃣ 数据库点赞数 +1
-            update().setSql("liked = liked + 1").eq("id", blogId).update();
-            // 2️⃣ Redis 用户点赞集合 + 全局点赞 ZSet + 热度 ZSet
             stringRedisTemplate.opsForSet().add(userLikeKey, blogId.toString());
             stringRedisTemplate.opsForZSet().incrementScore(blogLikedKey, blogId.toString(), 1);
-            stringRedisTemplate.opsForZSet().incrementScore(blogHotKey, blogId.toString(), 3); // 点赞加权
-            // 3️⃣ 标签热度 & 用户兴趣
+            stringRedisTemplate.opsForZSet().incrementScore(blogHotKey, blogId.toString(), 3); // 点赞热度 +3
+            // 标签热度 & 用户兴趣
             if (blog.getTags() != null && !blog.getTags().isEmpty()) {
                 for (String tag : blog.getTags().split(",")) {
-                    stringRedisTemplate.opsForZSet().incrementScore("blog:tag:" + tag, blogId.toString(), 3);
-                    stringRedisTemplate.opsForZSet().incrementScore("user:interest:" + userId, tag, 3);
+                    tag = tag.trim();
+                    if (!tag.isEmpty()) {
+                        stringRedisTemplate.opsForZSet().incrementScore("user:interest:" + userId, tag, 3);
+                    }
                 }
             }
         } else {
             // -------------------------------
             // 取消点赞
             // -------------------------------
-            update().setSql("liked = liked - 1").eq("id", blogId).update();
             stringRedisTemplate.opsForSet().remove(userLikeKey, blogId.toString());
             stringRedisTemplate.opsForZSet().incrementScore(blogLikedKey, blogId.toString(), -1);
-            stringRedisTemplate.opsForZSet().incrementScore(blogHotKey, blogId.toString(), -3);
+            stringRedisTemplate.opsForZSet().incrementScore(blogHotKey, blogId.toString(), -3); // 当天热度 -3
             // 标签热度 & 用户兴趣
             if (blog.getTags() != null && !blog.getTags().isEmpty()) {
                 for (String tag : blog.getTags().split(",")) {
-                    stringRedisTemplate.opsForZSet().incrementScore("blog:tag:" + tag, blogId.toString(), -3);
-                    stringRedisTemplate.opsForZSet().incrementScore("user:interest:" + userId, tag, -3);
+                    tag = tag.trim();
+                    if (!tag.isEmpty()) {
+                        stringRedisTemplate.opsForZSet().incrementScore("user:interest:" + userId, tag, -3);
+                    }
                 }
             }
         }
 
+        stringRedisTemplate.opsForSet().add("blog:dirty:liked", blogId.toString());
         return Result.ok();
     }
+
 
 
     /**
@@ -341,6 +384,11 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
         return Result.ok(userDTOS);
     }
 
+    /**
+     * 保存blog同时构造向量文本存储到数据库
+     * 并且把帖子的标签存入redis中。用于定时任务更新标签热度榜
+     * @param blog
+     */
     @Override
     @Transactional
     public void saveBlogWithVector(Blog blog) {
@@ -348,11 +396,13 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
         blog.setLiked(0);
         blog.setComments(0);
         blog.setViewCounts(0);
-        // 1. 保存到 MySQL
+        // 2. 保存到 MySQL
         this.save(blog);
-        // 2. 构造向量文本
+
+        // 3. 构造向量文本
         String content = buildBlogVectorText(blog);
-        // 3. 构造 Document
+
+        // 4. 构造 Document 并写入向量库
         Document document = new Document(
                 content,
                 Map.of(
@@ -362,8 +412,17 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
                         "tags", blog.getTags() == null ? "" : blog.getTags()
                 )
         );
-        // 4. 写入 Redis 向量库(自动embedding）
         vectorStore.add(List.of(document));
+        // 5. 写入 Redis blog:tags
+        if (blog.getTags() != null && !blog.getTags().isEmpty()) {
+            String redisKey = "blog:tags:" + blog.getId();
+            // tags 用逗号或 List 分割
+            String[] tags = blog.getTags().split(",");
+            stringRedisTemplate.opsForSet().add(redisKey, tags);
+            // TTL 设置为永不过期（数据库是主存储）
+            // 如果想设置TTL，可以用 Duration.ofDays(30) 之类
+            // stringRedisTemplate.expire(redisKey, Duration.ofDays(30));
+        }
     }
 
     /**

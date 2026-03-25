@@ -29,7 +29,7 @@ public class AiChatServiceImpl implements AiChatService {
     public Flux<String> chat(String question,Long userId) {
 
         // 1. 读取上下文（不给任何判断规则）
-        Deque<String> memory = chatMemory.getContext(userId);
+        Deque<String> memory = chatMemory.getContext(userId);//基于userid，保证了每个用户的对话记忆是分开的，不会混淆。
         String contextText = String.join("\n", memory);
 
         // 2. 直接用原始 question 做 embedding（不做 rewrite）
@@ -40,6 +40,18 @@ public class AiChatServiceImpl implements AiChatService {
 
         // 4. Prompt 环绕增强
         String ragPrompt = buildPrompt(contextText, contexts, question);
+        //你是一个本地生活推荐助手
+        //
+        //上下文：
+        //用户：推荐火锅
+        //助手：海底捞不错
+        //
+        //参考信息：
+        //海底捞火锅评分4.7
+        //重庆火锅评分4.6
+        //
+        //用户问题：
+        //附近还有吗
 
         // 5. 调用 LLM（streaming）
         Flux<String> flux = chatClient.prompt()
@@ -50,6 +62,11 @@ public class AiChatServiceImpl implements AiChatService {
         // 6. 写回 memory（用户输入 + AI 输出摘要）
         chatMemory.append(userId, "用户", question);
         chatMemory.append(userId, "助手", "正在推荐相关内容");
+
+        /**
+         * 写回的时候也带了 userId
+         * 所以不同用户的输入和助手回答都存到各自的上下文里
+         */
 
         return flux;
     }

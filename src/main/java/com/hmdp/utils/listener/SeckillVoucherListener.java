@@ -44,7 +44,6 @@ public class SeckillVoucherListener {
     @Transactional
     @RabbitListener(queues = "CQ")
     public void receiveOrder(Message message, Channel channel) throws Exception {
-
         // 每一条消息在 RabbitMQ 中都有一个唯一的 deliveryTag
         // ACK / NACK 都是基于它
         long deliveryTag = message.getMessageProperties().getDeliveryTag();

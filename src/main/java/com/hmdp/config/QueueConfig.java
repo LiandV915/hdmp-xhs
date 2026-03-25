@@ -65,6 +65,7 @@ public class QueueConfig {
         // 配置死信路由键，绑定到死信队列时使用
         arguments.put("x-dead-letter-routing-key", "DLQ");
 
+        //队列持久化
         return QueueBuilder.durable(QUEUE_C)
                 .withArguments(arguments)
                 .build();

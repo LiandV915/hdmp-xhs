@@ -22,6 +22,7 @@ public class WebMVCConfig implements WebMvcConfigurer {
 
     @Resource
     private RateLimitInterceptor rateLimitInterceptor;
+
     @Override
     public void addInterceptors(InterceptorRegistry registry) {
 
@@ -29,10 +30,9 @@ public class WebMVCConfig implements WebMvcConfigurer {
         // 0️⃣ 限流（最先）
         registry.addInterceptor(rateLimitInterceptor)
                 .addPathPatterns("/**")
-                .order(-1);
+                .order(-1);/*
 
-/*        限流是「系统保护」，
-        应该在任何业务、任何鉴权之前就拦掉恶意请求*/
+        限流是「系统保护」， 应该在任何业务、任何鉴权之前就拦掉恶意请求*/
 
 
         // 1. 刷新 token 拦截器（必须先执行）

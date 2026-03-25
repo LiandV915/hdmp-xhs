@@ -28,24 +28,25 @@ public class VectorSearchServiceImpl implements VectorSearchService {
         // 1. 向量转 byte[]（Redis VECTOR 必须）
         byte[] vectorBytes = floatArrayToByteArray(queryVector);
 
-        // 2. 构造 KNN 查询
-        // 注意：vector_field 一定要和你建 index 时的字段名一致
+        // 2. 构造 KNN 查询 这句是整段代码的灵魂
         String knnQuery =
                 "*=>[KNN " + topK + " @embedding $vector AS score]";
 
         Query query = new Query(knnQuery)
-                .addParam("vector", vectorBytes)
-                .setSortBy("score", true)
+                .addParam("vector", vectorBytes)//把你的查询向量传进去
+                .setSortBy("score", true)//按相似度排序（越小越相似）
                 .returnFields("content", "score")
                 .dialect(2);
 
-        // 3. 执行搜索
+        // 3. 执行搜索 去 Redis 里查向量库
+        //RedisTemplate 主要面向基础数据结构操作，对 RediSearch 的支持较弱，
+        // 而 Jedis 提供了对 FT.SEARCH 等命令的原生支持，因此在向量检索场景下选择 Jedis 更灵活。
         SearchResult result = vectorJedisPooled.ftSearch(
                 properties.getIndex(),
                 query
         );
 
-        // 4. 提取内容
+        // 4. 提取内容 把查到的文本拿出来
         List<String> contexts = new ArrayList<>();
         for (Document doc : result.getDocuments()) {
             Object content = doc.get("content");
