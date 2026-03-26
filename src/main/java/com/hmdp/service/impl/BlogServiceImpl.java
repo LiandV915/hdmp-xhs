@@ -16,6 +16,8 @@ import com.hmdp.service.IUserService;
 import com.hmdp.utils.CacheClient;
 import com.hmdp.utils.SystemConstants;
 import com.hmdp.utils.UserHolder;
+import org.redisson.api.RLock;
+import org.redisson.api.RedissonClient;
 import org.springframework.ai.document.Document;
 import org.springframework.ai.vectorstore.VectorStore;
 import org.springframework.ai.vectorstore.redis.RedisVectorStore;
@@ -30,6 +32,8 @@ import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.data.redis.core.script.DefaultRedisScript;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+
+import java.nio.charset.StandardCharsets;
 import java.time.LocalDate;
 import java.time.format.DateTimeFormatter;
 
@@ -62,12 +66,31 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
     CacheClient cacheClient;
 
     @Resource
+    private RedissonClient redissonClient;
+
+    @Resource
     private VectorStore vectorStore;
 
     @Resource
     private BlogMapper blogMapper;
 
     private static final DefaultRedisScript<Long> VIEW_SCRIPT;
+
+
+    /**
+     * 懒衰减间隔，例如 1 天衰减一次
+     */
+    private static final long INTEREST_DECAY_INTERVAL_MILLIS = TimeUnit.DAYS.toMillis(1);
+
+    /**
+     * 衰减系数，例如每次衰减到原来的 0.9
+     */
+    private static final double INTEREST_DECAY_FACTOR = 0.9;
+
+    /**
+     * 低于该分数的标签可直接删除，避免无效数据堆积
+     */
+    private static final double INTEREST_MIN_SCORE = 0.1;
 
     static {
         VIEW_SCRIPT= new DefaultRedisScript<>();
@@ -161,15 +184,13 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
 
 
 
+
     /**
-     *对于未登录的用户，推荐全局热门博客。
+     * 对于未登录的用户，推荐全局热门博客。
      * 对于登录用户，根据其兴趣标签推荐相关的博客，并去除已浏览和已推荐的博客，避免重复推荐。
      * 处理冷启动问题（新用户的推荐），如果推荐的博客不足，补充热门博客。
      * 排除用户自己发布的博客，避免推荐自己的内容。
      * 按照热度对推荐的博客进行排序，并更新已推荐集合。
-     * @param userId
-     * @param size
-     * @return
      */
     @Override
     public List<Blog> recommendBlogs(Long userId, int size) {
@@ -177,116 +198,326 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
         if (userId == null) {
             Set<String> topHot = stringRedisTemplate.opsForZSet()
                     .reverseRange("blog:hot", 0, size - 1);
-            return listByIds(topHot);
+            if (topHot == null || topHot.isEmpty()) {
+                return Collections.emptyList();
+            }
+            return listByIdsPreserveOrder(topHot);
         }
-        Set<String> candidateBlogIds = new LinkedHashSet<>();//待推送blog
-        // 2️⃣ 获取用户兴趣标签（优化：使用ZRANGE带分数）,取用户最感兴趣的前5标签
+        // 2️⃣ 推荐前先做兴趣懒衰减
+        lazyDecayUserInterestIfNeeded(userId);
+        Set<String> candidateBlogIds = new LinkedHashSet<>();
+
+        // 3️⃣ 获取用户兴趣标签，取最感兴趣的前5个标签
         Set<String> topTags = stringRedisTemplate.opsForZSet()
                 .reverseRange("user:interest:" + userId, 0, 4);
-        // 3️⃣ 标签召回（优化：限制每个标签召回数量，避免过多），每个标签召回三个
-        int perTagLimit = Math.max(3, size / Math.max(topTags.size(), 1));
+
+        // 4️⃣ 标签召回，每个标签召回一定数量
+        int tagCount = (topTags == null || topTags.isEmpty()) ? 1 : topTags.size();
+        int perTagLimit = Math.max(3, size / tagCount);
+
         if (topTags != null && !topTags.isEmpty()) {
             for (String tag : topTags) {
                 Set<String> blogs = stringRedisTemplate.opsForZSet()
                         .reverseRange("blog:tag:" + tag, 0, perTagLimit - 1);
-                if (blogs != null) candidateBlogIds.addAll(blogs);
+                if (blogs != null && !blogs.isEmpty()) {
+                    candidateBlogIds.addAll(blogs);
+                }
             }
         }
-        // 4️⃣ 批量获取排除集合(用户看过的，之前推送过的，用户自己写的）
+
+        // 5️⃣ 批量获取排除集合：用户看过的、已推荐的、自己发布的
         Set<String> excludeIds = new HashSet<>();
-        //pipeline 的核心价值就是：减少网络 RTT，避免大量来回的 Redis 请求。
         List<Object> results = stringRedisTemplate.executePipelined(new SessionCallback<Object>() {
             @Override
             public Object execute(RedisOperations operations) {
                 operations.opsForSet().members("user:view:" + userId);
-                operations.opsForSet().members("recommend:shown:" + userId);
+                operations.opsForSet().members("user:recommend:shown:" + userId);
                 operations.opsForSet().members("user:blog:" + userId);
                 return null;
             }
         });
-        // 把 pipeline 返回的 3 个 Set<String> 合并到 excludeIds
+
         for (Object obj : results) {
             if (obj instanceof Set) {
                 @SuppressWarnings("unchecked")
                 Set<String> set = (Set<String>) obj;
-                if (set != null) excludeIds.addAll(set);
+                if (set != null && !set.isEmpty()) {
+                    excludeIds.addAll(set);
+                }
             }
         }
-        // 5️⃣ 排除处理
+
+        // 6️⃣ 排除处理
         candidateBlogIds.removeAll(excludeIds);
-        // 6️⃣ 如果推荐不足：冷启动处理（优化：先排除再补充）
+
+        // 7️⃣ 推荐不足时补热门博客
         if (candidateBlogIds.size() < size) {
             int needMore = size - candidateBlogIds.size();
-            // 获取热门但未排除的博客
             Set<String> allHot = stringRedisTemplate.opsForZSet()
-                    .reverseRange("blog:hot", 0, size * 2 - 1); // 多取一些备用
-            if (allHot != null) {
+                    .reverseRange("blog:hot", 0, size * 2L - 1);
+            if (allHot != null && !allHot.isEmpty()) {
                 allHot.stream()
-                        .filter(id -> !excludeIds.contains(id))//不在排除的集合中
-                        .limit(needMore)//不超过数目
+                        .filter(id -> !excludeIds.contains(id))
+                        .filter(id -> !candidateBlogIds.contains(id))
+                        .limit(needMore)
                         .forEach(candidateBlogIds::add);
             }
         }
-        // 7️⃣ 按热度排序
+
+        // 8️⃣ 为空直接返回
         if (candidateBlogIds.isEmpty()) {
             return Collections.emptyList();
         }
-        // 批量获取热度分数
-        Map<String, Double> hotScores = new HashMap<>();
-        List<String> blogIdList = new ArrayList<>(candidateBlogIds);
-        List<Object> scores = stringRedisTemplate.executePipelined(
-                new RedisCallback<Object>() {
-                    @Override
-                    public Object doInRedis(RedisConnection connection) {
-                        for (String blogId : blogIdList) {
-                            connection.zSetCommands().zScore(
-                                    "blog:hot".getBytes(),
-                                    blogId.getBytes()
-                            );
-                        }
-                        return null;
-                    }
-                }
-        );
-// 解析 pipeline 返回值
-        for (int i = 0; i < blogIdList.size(); i++) {
-            Object score = scores.get(i);
-            if (score != null) {
-                hotScores.put(blogIdList.get(i),
-                        Double.valueOf(score.toString()));
-            }
-        }
 
-        // 排序
+        // 9️⃣ 批量获取热度分数
+        Map<String, Double> hotScores = batchGetHotScores(candidateBlogIds);
+
+        // 🔟 按热度排序
         List<String> sortedBlogIds = candidateBlogIds.stream()
-                .sorted((b1, b2) -> {
-                    Double s1 = hotScores.get(b1);
-                    Double s2 = hotScores.get(b2);
-                    return Double.compare(
-                            s2 != null ? s2 : 0,
-                            s1 != null ? s1 : 0
-                    );
-                })
+                .sorted((b1, b2) -> Double.compare(
+                        hotScores.getOrDefault(b2, 0.0),
+                        hotScores.getOrDefault(b1, 0.0)
+                ))
                 .limit(size)
                 .collect(Collectors.toList());
-        // 8️⃣ 更新已推荐集合（优化：设置过期时间，控制集合大小）
+
+        // 1️⃣1️⃣ 更新已推荐集合
         if (!sortedBlogIds.isEmpty()) {
             String shownKey = "user:recommend:shown:" + userId;
-            stringRedisTemplate.opsForSet().add(shownKey,
-                    sortedBlogIds.toArray(new String[0]));
-            // 控制集合大小，避免无限增长
+            stringRedisTemplate.opsForSet().add(shownKey, sortedBlogIds.toArray(new String[0]));
+
             Long shownSize = stringRedisTemplate.opsForSet().size(shownKey);
             if (shownSize != null && shownSize > 1000) {
-                // 随机移除一些旧记录，或使用LRU策略
                 stringRedisTemplate.opsForSet().pop(shownKey, shownSize - 800);
             }
-            // 设置过期时间（例如7天）
             stringRedisTemplate.expire(shownKey, 7, TimeUnit.DAYS);
         }
 
-        // 9️⃣ 查询数据库
-        return listByIds(sortedBlogIds);
+        // 1️⃣2️⃣ 查询数据库
+        return listByIdsPreserveOrder(sortedBlogIds);
     }
+
+    /**
+     * 懒衰减：在推荐时判断是否需要衰减用户兴趣标签
+     */
+    private void lazyDecayUserInterestIfNeeded(Long userId) {
+        String interestKey = "user:interest:" + userId;
+        String lastDecayKey = "user:interest:last_decay:" + userId;
+        String lockKey = "lock:user:interest:decay:" + userId;
+
+        long now = System.currentTimeMillis();
+
+        String lastDecayStr = stringRedisTemplate.opsForValue().get(lastDecayKey);
+        long lastDecayTime = parseLongOrDefault(lastDecayStr, 0L);
+
+        // 第一次没有记录时，初始化，不做衰减
+        if (lastDecayTime <= 0) {
+            stringRedisTemplate.opsForValue().set(
+                    lastDecayKey,
+                    String.valueOf(now),
+                    30,
+                    TimeUnit.DAYS
+            );
+            return;
+        }
+
+        long elapsed = now - lastDecayTime;
+        long periods = elapsed / INTEREST_DECAY_INTERVAL_MILLIS;
+
+        // 没到一个完整衰减周期，不处理
+        if (periods <= 0) {
+            return;
+        }
+
+        RLock lock = redissonClient.getLock(lockKey);
+        boolean locked = false;
+        try {
+            locked = lock.tryLock(0, 10, TimeUnit.SECONDS);
+            if (!locked) {
+                return;
+            }
+
+            // 锁内二次检查
+            lastDecayStr = stringRedisTemplate.opsForValue().get(lastDecayKey);
+            lastDecayTime = parseLongOrDefault(lastDecayStr, 0L);
+
+            if (lastDecayTime <= 0) {
+                stringRedisTemplate.opsForValue().set(
+                        lastDecayKey,
+                        String.valueOf(now),
+                        30,
+                        TimeUnit.DAYS
+                );
+                return;
+            }
+
+            elapsed = now - lastDecayTime;
+            periods = elapsed / INTEREST_DECAY_INTERVAL_MILLIS;
+
+            if (periods <= 0) {
+                return;
+            }
+
+            // 按周期数做指数衰减
+            doDecayUserInterest(interestKey, periods);
+
+            // last_decay 不是直接写 now，而是推进完整周期，避免小数时间丢失
+            long newLastDecayTime = lastDecayTime + periods * INTEREST_DECAY_INTERVAL_MILLIS;
+            stringRedisTemplate.opsForValue().set(
+                    lastDecayKey,
+                    String.valueOf(newLastDecayTime),
+                    30,
+                    TimeUnit.DAYS
+            );
+
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("获取用户兴趣衰减锁时被中断，userId=" + userId, e);
+        } finally {
+            if (locked && lock.isHeldByCurrentThread()) {
+                lock.unlock();
+            }
+        }
+    }
+
+    private void doDecayUserInterest(String interestKey, long periods) {
+        Set<String> tags = stringRedisTemplate.opsForZSet().range(interestKey, 0, -1);
+        if (tags == null || tags.isEmpty()) {
+            return;
+        }
+
+        double decayFactor = Math.pow(INTEREST_DECAY_FACTOR, periods);
+
+        List<Object> scores = stringRedisTemplate.executePipelined(new RedisCallback<Object>() {
+            @Override
+            public Object doInRedis(RedisConnection connection) {
+                byte[] keyBytes = interestKey.getBytes(StandardCharsets.UTF_8);
+                for (String tag : tags) {
+                    connection.zSetCommands().zScore(
+                            keyBytes,
+                            tag.getBytes(StandardCharsets.UTF_8)
+                    );
+                }
+                return null;
+            }
+        });
+
+        if (scores == null || scores.isEmpty()) {
+            return;
+        }
+
+        Set<String> removeTags = new HashSet<>();
+        Map<String, Double> newScores = new HashMap<>();
+
+        List<String> tagList = new ArrayList<>(tags);
+        for (int i = 0; i < tagList.size(); i++) {
+            Object scoreObj = scores.get(i);
+            if (scoreObj == null) {
+                continue;
+            }
+
+            double oldScore = Double.parseDouble(scoreObj.toString());
+            double newScore = oldScore * decayFactor;
+
+            if (newScore < INTEREST_MIN_SCORE) {
+                removeTags.add(tagList.get(i));
+            } else {
+                newScores.put(tagList.get(i), newScore);
+            }
+        }
+
+        stringRedisTemplate.executePipelined(new RedisCallback<Object>() {
+            @Override
+            public Object doInRedis(RedisConnection connection) {
+                byte[] keyBytes = interestKey.getBytes(StandardCharsets.UTF_8);
+
+                for (Map.Entry<String, Double> entry : newScores.entrySet()) {
+                    connection.zSetCommands().zAdd(
+                            keyBytes,
+                            entry.getValue(),
+                            entry.getKey().getBytes(StandardCharsets.UTF_8)
+                    );
+                }
+
+                if (!removeTags.isEmpty()) {
+                    byte[][] members = removeTags.stream()
+                            .map(tag -> tag.getBytes(StandardCharsets.UTF_8))
+                            .toArray(byte[][]::new);
+                    connection.zSetCommands().zRem(keyBytes, members);
+                }
+                return null;
+            }
+        });
+    }
+
+
+    /**
+     * 批量获取博客热度
+     */
+    private Map<String, Double> batchGetHotScores(Set<String> candidateBlogIds) {
+        Map<String, Double> hotScores = new HashMap<>();
+        List<String> blogIdList = new ArrayList<>(candidateBlogIds);
+
+        List<Object> scores = stringRedisTemplate.executePipelined(new RedisCallback<Object>() {
+            @Override
+            public Object doInRedis(RedisConnection connection) {
+                byte[] keyBytes = "blog:hot".getBytes(StandardCharsets.UTF_8);
+                for (String blogId : blogIdList) {
+                    connection.zSetCommands().zScore(
+                            keyBytes,
+                            blogId.getBytes(StandardCharsets.UTF_8)
+                    );
+                }
+                return null;
+            }
+        });
+
+        for (int i = 0; i < blogIdList.size(); i++) {
+            Object score = scores.get(i);
+            if (score != null) {
+                hotScores.put(blogIdList.get(i), Double.parseDouble(score.toString()));
+            }
+        }
+        return hotScores;
+    }
+
+    /**
+     * 保持输入ID顺序返回
+     */
+    private List<Blog> listByIdsPreserveOrder(Collection<String> ids) {
+        if (ids == null || ids.isEmpty()) {
+            return Collections.emptyList();
+        }
+
+        List<Long> blogIds = ids.stream()
+                .map(Long::valueOf)
+                .collect(Collectors.toList());
+
+        List<Blog> blogs = listByIds(blogIds);
+        Map<Long, Blog> blogMap = blogs.stream()
+                .collect(Collectors.toMap(Blog::getId, b -> b));
+
+        List<Blog> result = new ArrayList<>();
+        for (Long id : blogIds) {
+            Blog blog = blogMap.get(id);
+            if (blog != null) {
+                result.add(blog);
+            }
+        }
+        return result;
+    }
+
+    private long parseLongOrDefault(String value, long defaultValue) {
+        if (value == null || value.trim().isEmpty()) {
+            return defaultValue;
+        }
+        try {
+            return Long.parseLong(value);
+        } catch (Exception e) {
+            return defaultValue;
+        }
+    }
+
 
 
     /**

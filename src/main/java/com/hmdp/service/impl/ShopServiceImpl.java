@@ -20,6 +20,7 @@ import org.springframework.transaction.annotation.Transactional;
 
 import jakarta.annotation.Resource;
 
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ThreadLocalRandom;
@@ -27,6 +28,7 @@ import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
 import static com.hmdp.utils.RedisConstants.CACHE_NULL_TTL;
+import static org.apache.commons.lang3.StringUtils.defaultString;
 
 /**
  * <p>
@@ -162,7 +164,7 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
 
 
     /**
-     * 存数据
+     * 存数据(knowledgeText 是“让模型理解这是什么”，metadata 是“让系统管理这条知识”。)
      * @param shop
      */
     @Override
@@ -170,54 +172,93 @@ public class ShopServiceImpl extends ServiceImpl<ShopMapper, Shop> implements IS
     public void saveShopWithVector(Shop shop) {
         // 1. 保存到 MySQL
         this.save(shop);
+        // 2. 构造知识库文本
+        String content = buildShopKnowledgeText(shop);
 
-        // 2. 构造向量文本
-        String content = buildShopVectorText(shop);
-
-        // 3. 构造 Document
+        // 3. 构造知识库 Document
         Document document = new Document(
                 content,
-                Map.of(
-                        "shopId", shop.getId(),
-                        "typeId", shop.getTypeId(),
-                        "name", shop.getName(),
-                        "area", shop.getArea()
-                )
+                buildShopMetadata(shop)
         );
 
-        // 4. 写入 Redis 向量库
+        // 4. 写入 Redis 向量知识库
         vectorStore.add(List.of(document));
-        // 5. 写入缓存（逻辑过期策略）
-        // 使用你的 CacheClient 工具类
+
+        // 5. 写入缓存
         cacheClient.setWithExpire(
-                RedisConstants.CACHE_SHOP_KEY + shop.getId(), // key
-                shop,                                        // value
-                RedisConstants.CACHE_SHOP_TTL,              // TTL
+                RedisConstants.CACHE_SHOP_KEY + shop.getId(),
+                shop,
+                RedisConstants.CACHE_SHOP_TTL,
                 TimeUnit.MINUTES
         );
     }
 
+
     /**
-     * 店铺信息 → 向量文本
+     * 像“数据库字段 / 倒排索引字段”，解决:条件过滤 精确定位 维护更新 文档分类
+     * @param shop
+     * @return
      */
-    private String buildShopVectorText(Shop shop) {
+    private Map<String, Object> buildShopMetadata(Shop shop) {
+        Map<String, Object> metadata = new HashMap<>();
+        metadata.put("type", "kb_shop"); // 关键：知识库类型
+        metadata.put("shopId", String.valueOf(shop.getId()));
+        metadata.put("typeId", String.valueOf(shop.getTypeId()));
+        metadata.put("name", defaultString(shop.getName()));
+        metadata.put("area", defaultString(shop.getArea()));
+        metadata.put("address", defaultString(shop.getAddress()));
+        metadata.put("avgPrice", shop.getAvgPrice() == null ? "" : String.valueOf(shop.getAvgPrice()));
+        metadata.put("score", shop.getScore() == null ? "" : String.valueOf(shop.getScore()));
+        metadata.put("openHours", defaultString(shop.getOpenHours()));
+        metadata.put("timestamp", String.valueOf(System.currentTimeMillis()));
+        return metadata;
+    }
+
+
+    /**
+     * 构建店铺知识文本
+     * 解决：向量化 语义匹配 给模型看的上下文
+     * @param shop
+     * @return
+     */
+    private String buildShopKnowledgeText(Shop shop) {
         StringBuilder sb = new StringBuilder();
-        sb.append("店铺名称：").append(shop.getName()).append("。");
-        sb.append("商圈：").append(shop.getArea()).append("。");
-        sb.append("地址：").append(shop.getAddress()).append("。");
+        sb.append("这是一个本地生活平台中的店铺信息。");
+        sb.append("店铺名称是").append(defaultString(shop.getName())).append("。");
+
+        if (notBlank(shop.getArea())) {
+            sb.append("该店铺位于").append(shop.getArea()).append("商圈。");
+        }
+
+        if (notBlank(shop.getAddress())) {
+            sb.append("具体地址是").append(shop.getAddress()).append("。");
+        }
 
         if (shop.getAvgPrice() != null) {
-            sb.append("人均消费：").append(shop.getAvgPrice()).append("元。");
+            sb.append("人均消费大约").append(shop.getAvgPrice()).append("元。");
         }
+
         if (shop.getScore() != null) {
-            sb.append("评分：").append(shop.getScore() / 10.0).append("分。");
+            sb.append("用户评分大约").append(shop.getScore() / 10.0).append("分。");
         }
-        if (shop.getOpenHours() != null) {
-            sb.append("营业时间：").append(shop.getOpenHours()).append("。");
+
+        if (notBlank(shop.getOpenHours())) {
+            sb.append("营业时间为").append(shop.getOpenHours()).append("。");
         }
+        sb.append("该文档可用于回答用户关于店铺位置、价格、评分、营业时间等问题。");
 
         return sb.toString();
     }
+
+
+    private String defaultString(String str) {
+        return str == null ? "" : str.trim();
+    }
+
+    private boolean notBlank(String str) {
+        return str != null && !str.trim().isEmpty();
+    }
+
     /**
      * 尝试获取锁
      * @param key
