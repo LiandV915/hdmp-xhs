@@ -3,14 +3,11 @@ package com.hmdp.config;
 import com.hmdp.utils.LoginInterceptor;
 import com.hmdp.utils.RateLimitInterceptor;
 import com.hmdp.utils.RefreshTokenInterceptor;
-import com.hmdp.utils.ZSetRateLimiter;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.web.servlet.config.annotation.InterceptorRegistry;
 import org.springframework.web.servlet.config.annotation.WebMvcConfigurer;
 
-import jakarta.annotation
-.Resource;
+import jakarta.annotation.Resource;
 
 @Configuration
 public class WebMVCConfig implements WebMvcConfigurer {
@@ -46,12 +43,14 @@ public class WebMVCConfig implements WebMvcConfigurer {
                 .excludePathPatterns(
                         "/user/code",
                         "/user/login",
+                        "/user/search",
                         "/blog/hot",
+                        "/blog/search",
+                        "/blog/recommend",
                         "/shop/**",
                         "/shop-type/**",
                         "/upload/**",
-                        "/voucher/**",
-                        "/blog/recommend"
+                        "/voucher/**"
                 )
                 .order(1);
     }

@@ -5,7 +5,6 @@ import cn.hutool.core.util.BooleanUtil;
 import cn.hutool.core.util.StrUtil;
 import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
-import com.hmdp.dto.BlogSaveDTO;
 import com.hmdp.dto.Result;
 import com.hmdp.dto.UserDTO;
 import com.hmdp.entity.Blog;
@@ -45,14 +44,8 @@ import java.util.*;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
 
-/**
- * <p>
- * 服务实现类
- * </p>
- *
- * @author 虎哥
- * @since 2021-12-22
- */
+
+
 @Service
 public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IBlogService {
 
@@ -170,7 +163,17 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
             );
 
             // ===============================
-            // 4️⃣ 点赞状态
+            // 4️⃣ 写入浏览历史（ZSet，score=当前时间戳，最多保留200条）
+            // ===============================
+            String histKey = "user:history:" + userId;
+            stringRedisTemplate.opsForZSet().add(histKey, blogId.toString(), System.currentTimeMillis());
+            Long histSize = stringRedisTemplate.opsForZSet().size(histKey);
+            if (histSize != null && histSize > 200) {
+                stringRedisTemplate.opsForZSet().removeRange(histKey, 0, histSize - 201);
+            }
+
+            // ===============================
+            // 5️⃣ 点赞状态
             // ===============================
             Boolean liked = stringRedisTemplate.opsForSet()
                     .isMember("user:like:" + userId, blogId.toString());
@@ -627,6 +630,7 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
         blog.setLiked(0);
         blog.setComments(0);
         blog.setViewCounts(0);
+        if (blog.getShopId() == null) blog.setShopId(0L);
         // 2. 保存到 MySQL
         this.save(blog);
 
@@ -669,4 +673,229 @@ public class BlogServiceImpl extends ServiceImpl<BlogMapper, Blog> implements IB
         return sb.toString();
     }
 
+    // ================================================================
+    // 博客修改
+    // ================================================================
+    @Override
+    @Transactional
+    public Result updateBlog(Long id, Blog blog) {
+        UserDTO user = UserHolder.getUser();
+        if (user == null) {
+            return Result.fail("请先登录");
+        }
+        Blog old = getById(id);
+        if (old == null) {
+            return Result.fail("博客不存在");
+        }
+        if (!old.getUserId().equals(user.getId())) {
+            return Result.fail("无权修改他人博客");
+        }
+        blog.setId(id);
+        blog.setUserId(old.getUserId());
+        updateById(blog);
+        // 清除缓存
+        stringRedisTemplate.delete("blog:cache:" + id);
+        return Result.ok();
+    }
+
+    // ================================================================
+    // 博客删除
+    // ================================================================
+    @Override
+    @Transactional
+    public Result deleteBlog(Long id) {
+        UserDTO user = UserHolder.getUser();
+        if (user == null) {
+            return Result.fail("请先登录");
+        }
+        Blog blog = getById(id);
+        if (blog == null) {
+            return Result.fail("博客不存在");
+        }
+        if (!blog.getUserId().equals(user.getId())) {
+            return Result.fail("无权删除他人博客");
+        }
+        removeById(id);
+        // 清除缓存和 Redis 热度数据
+        stringRedisTemplate.delete("blog:cache:" + id);
+        stringRedisTemplate.opsForZSet().remove("blog:hot", id.toString());
+        stringRedisTemplate.opsForZSet().remove("blog:view", id.toString());
+        stringRedisTemplate.opsForZSet().remove("blog:liked", id.toString());
+        stringRedisTemplate.delete("blog:tags:" + id);
+        return Result.ok();
+    }
+
+    // ================================================================
+    // 查看某用户的博客列表（分页）
+    // ================================================================
+    @Override
+    public Result queryBlogOfUser(Long userId, Integer current) {
+        Page<Blog> page = query()
+                .eq("user_id", userId)
+                .orderByDesc("create_time")
+                .page(new Page<>(current, SystemConstants.MAX_PAGE_SIZE));
+        return Result.ok(page.getRecords(), page.getTotal());
+    }
+
+    // ================================================================
+    // 关注的人的 Feed 流（基于关注列表拉取，按时间滚动分页）
+    // ================================================================
+    @Override
+    public Result queryFollowBlog(Long lastId, Integer offset) {
+        UserDTO user = UserHolder.getUser();
+        if (user == null) {
+            return Result.fail("请先登录");
+        }
+        Long userId = user.getId();
+
+        // 从 Redis 获取当前用户关注的人列表
+        Set<String> followIds = stringRedisTemplate.opsForSet().members("follow:" + userId);
+        if (followIds == null || followIds.isEmpty()) {
+            return Result.ok(Collections.emptyList());
+        }
+
+        List<Long> followUserIds = followIds.stream().map(Long::valueOf).collect(Collectors.toList());
+
+        // 按时间倒序拉取关注人的博客，实现滚动分页
+        long maxTime = lastId == null ? System.currentTimeMillis() : lastId;
+        Page<Blog> page = query()
+                .in("user_id", followUserIds)
+                .le("create_time", new java.sql.Timestamp(maxTime).toLocalDateTime())
+                .orderByDesc("create_time")
+                .page(new Page<>(1, SystemConstants.MAX_PAGE_SIZE));
+
+        List<Blog> records = page.getRecords();
+        if (records.isEmpty()) {
+            return Result.ok(Collections.emptyList());
+        }
+
+        // 计算下一页的 minTime 和 offset
+        long minTime = records.get(records.size() - 1).getCreateTime()
+                .toInstant(java.time.ZoneOffset.ofHours(8)).toEpochMilli();
+
+        return Result.ok(records);
+    }
+
+    // ================================================================
+    // 关键词搜索博客（标题 / 内容模糊匹配）
+    // ================================================================
+    @Override
+    public Result searchBlog(String keyword, Integer current) {
+        if (StrUtil.isBlank(keyword)) {
+            return Result.fail("请输入搜索关键词");
+        }
+        Page<Blog> page = query()
+                .like("title", keyword)
+                .or()
+                .like("content", keyword)
+                .orderByDesc("create_time")
+                .page(new Page<>(current, SystemConstants.MAX_PAGE_SIZE));
+        return Result.ok(page.getRecords(), page.getTotal());
+    }
+
+    // ================================================================
+    // 收藏 / 取消收藏
+    // key: user:collect:{userId}  value: Set<blogId>
+    // ================================================================
+    @Override
+    public Result collectBlog(Long id) {
+        UserDTO user = UserHolder.getUser();
+        if (user == null) {
+            return Result.fail("请先登录");
+        }
+        Long userId = user.getId();
+
+        Blog blog = getById(id);
+        if (blog == null) {
+            return Result.fail("博客不存在");
+        }
+
+        String collectKey = "user:collect:" + userId;
+        Boolean isCollected = stringRedisTemplate.opsForSet().isMember(collectKey, id.toString());
+        if (Boolean.TRUE.equals(isCollected)) {
+            stringRedisTemplate.opsForSet().remove(collectKey, id.toString());
+            return Result.ok(false);
+        } else {
+            stringRedisTemplate.opsForSet().add(collectKey, id.toString());
+            return Result.ok(true);
+        }
+    }
+
+    // ================================================================
+    // 查看我的收藏列表
+    // ================================================================
+    @Override
+    public Result queryMyCollect(Integer current) {
+        UserDTO user = UserHolder.getUser();
+        if (user == null) {
+            return Result.fail("请先登录");
+        }
+        Long userId = user.getId();
+
+        String collectKey = "user:collect:" + userId;
+        Set<String> collectIds = stringRedisTemplate.opsForSet().members(collectKey);
+        if (collectIds == null || collectIds.isEmpty()) {
+            return Result.ok(Collections.emptyList());
+        }
+
+        List<Blog> blogs = listByIdsPreserveOrder(collectIds);
+        return Result.ok(blogs);
+    }
+
+    // ================================================================
+    // 热门博客排行
+    // 数据源：blog:hot（全局热度 ZSet，getBlogById / 点赞 / 评论时累计写入）
+    // 返回按热度降序的博客列表
+    // ================================================================
+    @Override
+    public Result queryHotBlogs(Integer size) {
+        int limit = (size == null || size <= 0) ? 10 : Math.min(size, 50);
+        Set<String> hotIds = stringRedisTemplate.opsForZSet()
+                .reverseRange("blog:hot", 0, limit - 1);
+        if (hotIds == null || hotIds.isEmpty()) {
+            return Result.ok(Collections.emptyList());
+        }
+        List<Blog> blogs = listByIdsPreserveOrder(hotIds);
+        return Result.ok(blogs);
+    }
+
+    // ================================================================
+    // 我的浏览历史
+    // 数据源：user:history:{userId}（ZSet，score=浏览时间戳，按时间倒序）
+    // 在 getBlogById 中写入，此处只做查询
+    // ================================================================
+    @Override
+    public Result queryBlogHistory(Integer current) {
+        UserDTO user = UserHolder.getUser();
+        if (user == null) {
+            return Result.fail("请先登录");
+        }
+        Long userId = user.getId();
+        String histKey = "user:history:" + userId;
+
+        // ZSet reverseRange 实现分页：每页 MAX_PAGE_SIZE 条，按 score(时间戳) 倒序
+        long start = (long) (current - 1) * SystemConstants.MAX_PAGE_SIZE;
+        long end   = start + SystemConstants.MAX_PAGE_SIZE - 1;
+        Set<String> ids = stringRedisTemplate.opsForZSet().reverseRange(histKey, start, end);
+        if (ids == null || ids.isEmpty()) {
+            return Result.ok(Collections.emptyList());
+        }
+
+        Long total = stringRedisTemplate.opsForZSet().size(histKey);
+        List<Blog> blogs = listByIdsPreserveOrder(ids);
+        return Result.ok(blogs, total == null ? 0L : total);
+    }
+
+    // ================================================================
+    // 清空我的浏览历史
+    // ================================================================
+    @Override
+    public Result clearBlogHistory() {
+        UserDTO user = UserHolder.getUser();
+        if (user == null) {
+            return Result.fail("请先登录");
+        }
+        stringRedisTemplate.delete("user:history:" + user.getId());
+        return Result.ok();
+    }
 }

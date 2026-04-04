@@ -79,21 +79,52 @@ public class FollowServiceImpl extends ServiceImpl<FollowMapper, Follow> impleme
         Long thisUserId = UserHolder.getUser().getId();
         String key1 = "follow:" + thisUserId;
         String key2 = "follow:" + userId;
-        Set<String> commonSet=stringRedisTemplate.opsForSet().intersect(key1,key2);
-        if(commonSet==null){
+        Set<String> commonSet = stringRedisTemplate.opsForSet().intersect(key1, key2);
+        if (commonSet == null || commonSet.isEmpty()) {
             return Result.ok(Collections.emptyList());
         }
-        List<Long> ids= commonSet.stream().map(Long::valueOf).toList();
-        List<UserDTO> list1 = userService.listByIds(ids).stream().
-                map(user ->
-                {
-                    UserDTO dto = new UserDTO();
-                    BeanUtils.copyProperties(user, dto);
-                    return dto;
-                })
-                .toList();
-        return Result.ok(list1);
+        List<Long> ids = commonSet.stream().map(Long::valueOf).toList();
+        List<UserDTO> list = userService.listByIds(ids).stream().map(user -> {
+            UserDTO dto = new UserDTO();
+            BeanUtils.copyProperties(user, dto);
+            return dto;
+        }).toList();
+        return Result.ok(list);
     }
 
+    // ================================================================
+    // 查看 userId 关注的人列表
+    // ================================================================
+    @Override
+    public Result getFollowList(Long userId) {
+        List<Follow> follows = query().eq("user_id", userId).list();
+        if (follows == null || follows.isEmpty()) {
+            return Result.ok(Collections.emptyList());
+        }
+        List<Long> followUserIds = follows.stream().map(Follow::getFollowUserId).toList();
+        List<UserDTO> users = userService.listByIds(followUserIds).stream().map(user -> {
+            UserDTO dto = new UserDTO();
+            BeanUtils.copyProperties(user, dto);
+            return dto;
+        }).toList();
+        return Result.ok(users);
+    }
 
+    // ================================================================
+    // 查看 userId 的粉丝列表（谁关注了 userId）
+    // ================================================================
+    @Override
+    public Result getFansList(Long userId) {
+        List<Follow> fans = query().eq("follow_user_id", userId).list();
+        if (fans == null || fans.isEmpty()) {
+            return Result.ok(Collections.emptyList());
+        }
+        List<Long> fanUserIds = fans.stream().map(Follow::getUserId).toList();
+        List<UserDTO> users = userService.listByIds(fanUserIds).stream().map(user -> {
+            UserDTO dto = new UserDTO();
+            BeanUtils.copyProperties(user, dto);
+            return dto;
+        }).toList();
+        return Result.ok(users);
+    }
 }

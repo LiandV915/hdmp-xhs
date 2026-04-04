@@ -44,6 +44,25 @@ public class UploadController {
         return Result.ok();
     }
 
+    /** 上传用户头像 */
+    @PostMapping("/avatar")
+    public Result uploadAvatar(@RequestParam("file") MultipartFile image) {
+        try {
+            String originalFilename = image.getOriginalFilename();
+            String suffix = StrUtil.subAfter(originalFilename, ".", true);
+            String fileName = "avatar/" + UUID.randomUUID() + "." + suffix;
+            File dir = new File(SystemConstants.IMAGE_UPLOAD_DIR, "avatar");
+            if (!dir.exists()) {
+                dir.mkdirs();
+            }
+            image.transferTo(new File(SystemConstants.IMAGE_UPLOAD_DIR, fileName));
+            log.debug("头像上传成功，{}", fileName);
+            return Result.ok(fileName);
+        } catch (IOException e) {
+            throw new RuntimeException("头像上传失败", e);
+        }
+    }
+
     private String createNewFileName(String originalFilename) {
         // 获取后缀
         String suffix = StrUtil.subAfter(originalFilename, ".", true);

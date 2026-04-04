@@ -2,16 +2,23 @@ package com.hmdp.service.impl;
 
 import cn.hutool.core.bean.BeanUtil;
 import cn.hutool.json.JSONUtil;
+import com.baomidou.mybatisplus.extension.plugins.pagination.Page;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.dto.Result;
+import com.hmdp.dto.VoucherOrderVO;
 import com.hmdp.entity.SeckillVoucher;
+import com.hmdp.entity.Shop;
+import com.hmdp.entity.Voucher;
 import com.hmdp.entity.VoucherOrder;
 import com.hmdp.mapper.VoucherOrderMapper;
 import com.hmdp.service.ISeckillVoucherService;
+import com.hmdp.service.IShopService;
 import com.hmdp.service.IVoucherOrderService;
+import com.hmdp.service.IVoucherService;
 import com.hmdp.utils.RedisConstants;
 import com.hmdp.utils.RedisIdWorker;
 import com.hmdp.utils.SimpleRedisLock;
+import com.hmdp.utils.SystemConstants;
 import com.hmdp.utils.UserHolder;
 import org.redisson.api.RLock;
 import org.redisson.api.RedissonClient;
@@ -31,13 +38,12 @@ import jakarta.annotation
 .Resource;
 import java.time.Duration;
 import java.time.LocalDateTime;
-import java.util.Collections;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.stream.Collectors;
 
 /**
  * <p>
@@ -66,6 +72,12 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
 
     @Autowired
     RabbitTemplate rabbitTemplate;
+
+    @Autowired
+    private IVoucherService voucherService;
+
+    @Autowired
+    private IShopService shopService;
 
     /**
      * 存储订单的阻塞队列
@@ -124,6 +136,112 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         }
         // 3. 返回订单号给前端（实际下单异步处理）
         return Result.ok(orderId);
+    }
+
+    // ================================================================
+    // 我的订单列表
+    // ================================================================
+    @Override
+    public Result queryMyOrders(Integer current, Integer status) {
+        Long userId = UserHolder.getUser().getId();
+        Page<VoucherOrder> page = query()
+                .eq("user_id", userId)
+                .eq(status != null, "status", status)
+                .orderByDesc("create_time")
+                .page(new Page<>(current, SystemConstants.MAX_PAGE_SIZE));
+
+        List<VoucherOrder> records = page.getRecords();
+        if (records.isEmpty()) {
+            return Result.ok(Collections.emptyList(), 0L);
+        }
+
+        // 批量查询券信息
+        List<Long> voucherIds = records.stream()
+                .map(VoucherOrder::getVoucherId).distinct().collect(Collectors.toList());
+        Map<Long, Voucher> voucherMap = voucherService.listByIds(voucherIds).stream()
+                .collect(Collectors.toMap(Voucher::getId, v -> v));
+
+        // 批量查询商铺信息
+        List<Long> shopIds = voucherMap.values().stream()
+                .map(Voucher::getShopId).distinct().collect(Collectors.toList());
+        Map<Long, Shop> shopMap = shopService.listByIds(shopIds).stream()
+                .collect(Collectors.toMap(Shop::getId, s -> s));
+
+        List<VoucherOrderVO> voList = records.stream().map(order -> {
+            VoucherOrderVO vo = new VoucherOrderVO();
+            vo.setId(order.getId());
+            vo.setVoucherId(order.getVoucherId());
+            vo.setPayType(order.getPayType());
+            vo.setStatus(order.getStatus());
+            vo.setCreateTime(order.getCreateTime());
+            vo.setPayTime(order.getPayTime());
+            vo.setUseTime(order.getUseTime());
+            vo.setRefundTime(order.getRefundTime());
+            Voucher voucher = voucherMap.get(order.getVoucherId());
+            if (voucher != null) {
+                vo.setVoucherTitle(voucher.getTitle());
+                vo.setVoucherSubTitle(voucher.getSubTitle());
+                vo.setPayValue(voucher.getPayValue());
+                vo.setShopId(voucher.getShopId());
+                Shop shop = shopMap.get(voucher.getShopId());
+                if (shop != null) {
+                    vo.setShopName(shop.getName());
+                }
+            }
+            return vo;
+        }).collect(Collectors.toList());
+
+        return Result.ok(voList, page.getTotal());
+    }
+
+    // ================================================================
+    // 订单详情
+    // ================================================================
+    @Override
+    public Result queryOrderById(Long id) {
+        Long userId = UserHolder.getUser().getId();
+        VoucherOrder order = query().eq("id", id).eq("user_id", userId).one();
+        if (order == null) {
+            return Result.fail("订单不存在");
+        }
+        Voucher voucher = voucherService.getById(order.getVoucherId());
+        VoucherOrderVO vo = new VoucherOrderVO();
+        vo.setId(order.getId());
+        vo.setVoucherId(order.getVoucherId());
+        vo.setPayType(order.getPayType());
+        vo.setStatus(order.getStatus());
+        vo.setCreateTime(order.getCreateTime());
+        vo.setPayTime(order.getPayTime());
+        vo.setUseTime(order.getUseTime());
+        vo.setRefundTime(order.getRefundTime());
+        if (voucher != null) {
+            vo.setVoucherTitle(voucher.getTitle());
+            vo.setVoucherSubTitle(voucher.getSubTitle());
+            vo.setPayValue(voucher.getPayValue());
+            vo.setShopId(voucher.getShopId());
+            Shop shop = shopService.getById(voucher.getShopId());
+            if (shop != null) {
+                vo.setShopName(shop.getName());
+            }
+        }
+        return Result.ok(vo);
+    }
+
+    // ================================================================
+    // 取消订单（仅限未支付状态）
+    // ================================================================
+    @Override
+    public Result cancelOrder(Long id) {
+        Long userId = UserHolder.getUser().getId();
+        VoucherOrder order = query().eq("id", id).eq("user_id", userId).one();
+        if (order == null) {
+            return Result.fail("订单不存在");
+        }
+        if (order.getStatus() != 1) {
+            return Result.fail("当前订单状态不可取消，仅未支付订单可取消");
+        }
+        boolean ok = update().set("status", 4).eq("id", id).update();
+        return ok ? Result.ok() : Result.fail("取消失败，请重试");
     }
 }
 

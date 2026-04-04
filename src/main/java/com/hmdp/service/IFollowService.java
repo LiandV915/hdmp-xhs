@@ -19,4 +19,10 @@ public interface IFollowService extends IService<Follow> {
     Result getfollow(Long userId);
 
     Result getCommonFollow(Long userId);
+
+    /** 查看我的关注列表 */
+    Result getFollowList(Long userId);
+
+    /** 查看某用户的粉丝列表 */
+    Result getFansList(Long userId);
 }

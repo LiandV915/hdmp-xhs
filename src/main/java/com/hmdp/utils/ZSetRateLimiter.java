@@ -14,11 +14,11 @@ public class ZSetRateLimiter {
     private StringRedisTemplate stringRedisTemplate;
 
 
-
-    public boolean allowRequest(String key, int maxCount,int windowSeconds) {
+    public boolean allowRequest(String key, int maxCount) {
 
         long now = System.currentTimeMillis();
-        long windowStart = now - windowSeconds* 1000L;
+        int windowSeconds = 60;
+        long windowStart = now - windowSeconds * 1000L;
         // 1. 删除窗口外请求
         stringRedisTemplate.opsForZSet()
                 .removeRangeByScore(key, 0, windowStart);
